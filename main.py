@@ -1,186 +1,247 @@
 import os
+import time
+import uuid
+import asyncio
 import logging
-from decimal import Decimal
-from uuid import uuid4
+from decimal import Decimal, InvalidOperation
 
-import requests
-from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    Update
-)
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.error import TelegramError
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 YOOKASSA_SHOP_ID = os.environ["YOOKASSA_SHOP_ID"]
 YOOKASSA_SECRET_KEY = os.environ["YOOKASSA_SECRET_KEY"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]  # e.g. -1001234567890 or @channelusername
-PRICE_RUB = Decimal(os.getenv("PRICE_RUB", "1990.00"))
-PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Интенсив Di Sign")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "intensive_design_bot")
+CHANNEL_ID = int(os.environ["CHANNEL_ID"])
+PRICE_RUB = os.environ.get("PRICE_RUB", "4414.00")
+PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Интенсив Di Sign")
+BASE_URL = os.environ.get("BASE_URL", "https://intensive-design-bot.onrender.com").rstrip("/")
 
+TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+YOOKASSA_WEBHOOK_PATH = "/yookassa/webhook"
+
+app = FastAPI()
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-app = FastAPI(title="Intensive Di Sign Bot")
+tg_app = Application.builder().token(BOT_TOKEN).build()
+
+# Guards duplicate webhook deliveries while this instance is running.
+processed_payments: set[str] = set()
+processing_payments: set[str] = set()
+payment_lock = asyncio.Lock()
 
 
-def money(value: Decimal) -> str:
-    return f"{value:.2f}"
+def expected_amount() -> Decimal:
+    try:
+        return Decimal(PRICE_RUB).quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise RuntimeError("PRICE_RUB must be a valid number, e.g. 4414.00") from exc
 
 
-def create_payment(telegram_id: int) -> dict:
-    """Create a YooKassa redirect payment with Telegram ID in metadata."""
+async def yookassa_request(method: str, path: str, **kwargs) -> dict:
+    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.request(
+            method,
+            f"https://api.yookassa.ru/v3{path}",
+            auth=auth,
+            **kwargs,
+        )
+    if response.status_code >= 400:
+        logger.error("YooKassa API error %s: %s", response.status_code, response.text)
+        raise RuntimeError(f"YooKassa API returned HTTP {response.status_code}")
+    return response.json()
+
+
+async def create_yookassa_payment(user_id: int) -> str:
+    amount = expected_amount()
     payload = {
-        "amount": {"value": money(PRICE_RUB), "currency": "RUB"},
+        "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
         "capture": True,
         "confirmation": {
             "type": "redirect",
-            "return_url": f"https://t.me/{BOT_USERNAME}",
+            "return_url": f"{BASE_URL}/payment/return",
         },
-        "description": PRODUCT_NAME,
+        "description": f"{PRODUCT_NAME} — доступ к закрытому каналу",
         "metadata": {
-            "telegram_id": str(telegram_id),
+            "telegram_user_id": str(user_id),
             "product": PRODUCT_NAME,
         },
     }
-
-    # YooKassa requires a unique Idempotence-Key per payment creation attempt.
-    r = requests.post(
-        "https://api.yookassa.ru/v3/payments",
-        auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+    data = await yookassa_request(
+        "POST",
+        "/payments",
         headers={
+            "Idempotence-Key": str(uuid.uuid4()),
             "Content-Type": "application/json",
-            "Idempotence-Key": str(uuid4()),
         },
         json=payload,
-        timeout=20,
     )
-    if r.status_code >= 400:
-        log.error("YooKassa error %s: %s", r.status_code, r.text)
-        raise RuntimeError(f"YooKassa error {r.status_code}: {r.text}")
-    return r.json()
+    confirmation_url = (data.get("confirmation") or {}).get("confirmation_url")
+    if not confirmation_url or not data.get("id"):
+        logger.error("Unexpected YooKassa response: %s", data)
+        raise RuntimeError("YooKassa did not return a payment URL")
+    return confirmation_url
 
 
-async def send_access(telegram_id: int):
-    """Create a one-person invite link and send it to the buyer."""
-    # If the user is already in the channel, don't create/send another link.
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, telegram_id)
-        if member.status in {"member", "administrator", "creator"}:
-            await bot.send_message(
-                telegram_id,
-                "Ты уже в канале 💅\nЕсли потеряла ссылку — она тебе не нужна, доступ уже есть."
-            )
-            return
-    except Exception:
-        # A user who isn't in the channel can produce an error here; that's fine.
-        pass
-
-    invite = await bot.create_chat_invite_link(
-        chat_id=CHANNEL_ID,
-        name=f"purchase-{telegram_id}",
-        member_limit=1,
-    )
-
-    await bot.send_message(
-        telegram_id,
-        "🎉 Оплата прошла!\n\n"
-        f"Добро пожаловать в {PRODUCT_NAME}.\n"
-        "Нажми кнопку ниже — ссылка рассчитана на один вход.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🎓 Войти в канал", url=invite.invite_link)]
-            ]
-        ),
-    )
+async def get_yookassa_payment(payment_id: str) -> dict:
+    return await yookassa_request("GET", f"/payments/{payment_id}")
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"💳 Купить доступ — {money(PRICE_RUB)} ₽",
-                callback_data="buy"
-            )],
-        ]
-    )
-    await message.answer(
-        f"🎓 <b>{PRODUCT_NAME}</b>\n\n"
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    await update.message.reply_text(
+        f"🎓 {PRODUCT_NAME}\n\n"
         "Единоразовый доступ к закрытому каналу.\n"
-        f"Стоимость: <b>{money(PRICE_RUB)} ₽</b>\n\n"
-        "После успешной оплаты бот автоматически пришлёт персональную ссылку для входа.",
-        parse_mode="HTML",
-        reply_markup=kb,
+        f"Стоимость: {PRICE_RUB} ₽\n\n"
+        "После успешной оплаты бот автоматически пришлёт "
+        "персональную одноразовую ссылку для входа.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💳 Купить доступ — {PRICE_RUB} ₽", callback_data="buy")]
+        ]),
     )
 
 
-@dp.callback_query(F.data == "buy")
-async def buy(callback: CallbackQuery):
-    await callback.answer()
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    if query.data != "buy" or not query.from_user:
+        return
+
     try:
-        payment = create_payment(callback.from_user.id)
-        url = payment["confirmation"]["confirmation_url"]
-        await callback.message.answer(
-            f"💳 <b>{PRODUCT_NAME}</b>\n\n"
-            f"Сумма: <b>{money(PRICE_RUB)} ₽</b>\n\n"
-            "Нажми кнопку ниже и оплати на странице ЮKassa.\n"
-            "После успешной оплаты доступ придёт автоматически.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Оплатить", url=url)]
-                ]
-            ),
-        )
+        payment_url = await create_yookassa_payment(query.from_user.id)
     except Exception:
-        log.exception("Could not create payment")
-        await callback.message.answer(
-            "Не удалось создать платёж. Напиши мне, и я проверю оплату."
+        logger.exception("Failed to create YooKassa payment")
+        await query.message.reply_text("Не удалось создать платёж. Попробуй ещё раз через минуту.")
+        return
+
+    await query.message.reply_text(
+        "Платёж создан. Нажми кнопку ниже и оплати.\n\n"
+        "После успешной оплаты вернись в Telegram — бот автоматически "
+        "пришлёт персональную ссылку на закрытый канал.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Перейти к оплате", url=payment_url)]
+        ]),
+    )
+
+
+async def process_successful_payment(event_payment: dict):
+    payment_id = event_payment.get("id")
+    if not payment_id:
+        raise RuntimeError("Webhook payment has no id")
+
+    async with payment_lock:
+        if payment_id in processed_payments or payment_id in processing_payments:
+            return
+        processing_payments.add(payment_id)
+
+    try:
+        # Never trust the webhook body alone. Re-read the payment from YooKassa
+        # using the merchant credentials and verify the amount/metadata.
+        payment = await get_yookassa_payment(payment_id)
+
+        if payment.get("status") != "succeeded" or payment.get("paid") is not True:
+            logger.info("Payment %s is not successfully paid yet", payment_id)
+            return
+
+        amount = (payment.get("amount") or {}).get("value")
+        currency = (payment.get("amount") or {}).get("currency")
+        if currency != "RUB" or Decimal(str(amount)) != expected_amount():
+            raise RuntimeError(f"Unexpected payment amount/currency for {payment_id}: {amount} {currency}")
+
+        metadata = payment.get("metadata") or {}
+        user_id_raw = metadata.get("telegram_user_id")
+        if not user_id_raw:
+            raise RuntimeError(f"Payment {payment_id} has no telegram_user_id metadata")
+        user_id = int(user_id_raw)
+
+        # If the buyer already joined, do not create another invite.
+        try:
+            member = await bot.get_chat_member(CHANNEL_ID, user_id)
+            if member.status in {"member", "administrator", "creator"}:
+                await bot.send_message(user_id, "✅ Оплата прошла. Ты уже состоишь в закрытом канале.")
+                processed_payments.add(payment_id)
+                return
+        except TelegramError:
+            pass
+
+        invite = await bot.create_chat_invite_link(
+            chat_id=CHANNEL_ID,
+            name=f"payment-{payment_id[:12]}",
+            expire_date=int(time.time()) + 24 * 60 * 60,
+            member_limit=1,
+            creates_join_request=False,
         )
 
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 Оплата прошла успешно!\n\n"
+                "Твоя персональная ссылка для входа в закрытый канал:\n\n"
+                f"👉 {invite.invite_link}\n\n"
+                "Ссылка одноразовая: по ней сможет войти только один человек. "
+                "Она действует 24 часа. Не передавай её другим."
+            ),
+            disable_web_page_preview=True,
+        )
+        processed_payments.add(payment_id)
+        logger.info("Invite sent to Telegram user %s for payment %s", user_id, payment_id)
+    finally:
+        processing_payments.discard(payment_id)
 
-@app.get("/")
-async def health():
-    return {"ok": True}
+
+tg_app.add_handler(CommandHandler("start", start_command))
+tg_app.add_handler(CallbackQueryHandler(buy_callback))
 
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
-
-@app.post("/yookassa/webhook")
-async def yookassa_webhook(request: Request):
-    # YooKassa sends a notification when a payment changes status.
-    data = await request.json()
-
-    event = data.get("event")
-    obj = data.get("object", {})
-    if event != "payment.succeeded":
-        return {"ok": True}
-
-    metadata = obj.get("metadata") or {}
-    telegram_id = metadata.get("telegram_id")
-    if not telegram_id:
-        log.error("No telegram_id in payment metadata: %s", data)
-        return {"ok": True}
-
-    # Trust only a payment that YooKassa reports as paid/succeeded.
-    if obj.get("status") != "succeeded" or not obj.get("paid"):
-        return {"ok": True}
-
-    await send_access(int(telegram_id))
-    return {"ok": True}
+@app.on_event("startup")
+async def startup():
+    await tg_app.initialize()
+    await tg_app.start()
+    webhook_url = f"{BASE_URL}{TELEGRAM_WEBHOOK_PATH}"
+    await bot.set_webhook(url=webhook_url, allowed_updates=["message", "callback_query"])
+    logger.info("Telegram webhook set to %s", webhook_url)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await bot.session.close()
+    await tg_app.stop()
+    await tg_app.shutdown()
+
+
+@app.post(TELEGRAM_WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    update = Update.de_json(await request.json(), bot)
+    await tg_app.process_update(update)
+    return JSONResponse({"ok": True})
+
+
+@app.post(YOOKASSA_WEBHOOK_PATH)
+async def yookassa_webhook(request: Request):
+    data = await request.json()
+    if data.get("event") == "payment.succeeded":
+        await process_successful_payment(data.get("object") or {})
+    return JSONResponse({"ok": True})
+
+
+@app.get("/payment/return", response_class=HTMLResponse)
+async def payment_return():
+    return HTMLResponse(
+        """<!doctype html><html lang='ru'><meta name='viewport' content='width=device-width,initial-scale=1'>
+        <title>Оплата</title><body style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:40px 24px;text-align:center'>
+        <h2>Оплата завершена</h2><p>Вернись в Telegram — бот автоматически пришлёт персональную ссылку для входа.</p>
+        </body></html>"""
+    )
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "intensive-design-bot"}
