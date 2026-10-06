@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 httpx
-aiogram
+python-telegram-bot==22.5
