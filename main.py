@@ -27,8 +27,8 @@ TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
 YOOKASSA_WEBHOOK_PATH = "/yookassa/webhook"
 
 app = FastAPI()
-bot = Bot(BOT_TOKEN)
 tg_app = Application.builder().token(BOT_TOKEN).build()
+bot = tg_app.bot
 
 # Guards duplicate webhook deliveries while this instance is running.
 processed_payments: set[str] = set()
